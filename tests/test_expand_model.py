@@ -5,6 +5,7 @@
 
 import itertools
 import random
+import time
 from fractions import Fraction
 
 from fastapi.testclient import TestClient
@@ -954,6 +955,271 @@ def test_expansion_exactly_64_gates_ok():
     r = post(payload)
     assert r.status_code == 200, r.text
     assert len(r.json()["gates"]) == 64
+
+
+def test_dense_8ary_depth8_rejected_without_tree_walk():
+    """密集嵌套：8 层、每层 8 个同构子实例、每模板 1 门。
+
+    全树有 1+8+…+8^7=2396745 个实例（门），远超 64；门数判定必须只在
+    模板调用图上完成、立即返回 422，不能遍历实例树（修复前需数秒）。
+    """
+    templates = {}
+    for i in range(8):
+        if i == 0:
+            tpl_def = {
+                "params": ["p"],
+                "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+                "instances": [],
+                "top": "g",
+            }
+        else:
+            tpl_def = {
+                "params": ["p"],
+                "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+                "instances": [
+                    {"id": f"c{j}", "template": f"L{i-1}",
+                     "bindings": {"p": "p"}}
+                    for j in range(8)
+                ],
+                "top": "g",
+            }
+        templates[f"L{i}"] = tpl_def
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": templates,
+        "root": {"template": "L7", "bindings": {"p": "e1"}},
+    }
+
+    t0 = time.perf_counter()
+    r = post(payload)
+    elapsed = time.perf_counter() - t0
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "64" in detail
+    # 不遍历完整实例树：即使实例树有 240 万节点也应瞬时返回
+    assert elapsed < 2.0, elapsed
+
+
+def test_gate_count_via_call_graph_shared_template_memoized():
+    """同一叶子模板被实例化多次：门数按调用关系倍数累加。
+
+    Leaf=8 门；Mid 有 7 个自身门 + 2 个 Leaf 实例，共 23 门；
+    Root 有 1 个自身门 + 3 个 Mid 实例，共 1 + 3*23 = 70 > 64。
+    实际只有 13 个实例，超限完全由同构模板的多次实例化造成。
+    """
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": {
+            "Leaf": {
+                "params": ["p"],
+                "gates": [
+                    {"id": f"g{j}", "op": "NOT", "inputs": ["p"]}
+                    for j in range(8)
+                ],
+                "instances": [],
+                "top": "g7",
+            },
+            "Mid": {
+                "params": ["p"],
+                "gates": [
+                    {"id": f"m{j}", "op": "NOT", "inputs": ["p"]}
+                    for j in range(7)
+                ],
+                "instances": [
+                    {"id": "a", "template": "Leaf",
+                     "bindings": {"p": "p"}},
+                    {"id": "b", "template": "Leaf",
+                     "bindings": {"p": "p"}},
+                ],
+                "top": "m0",
+            },
+            "Root": {
+                "params": ["p"],
+                "gates": [{"id": "r", "op": "NOT", "inputs": ["p"]}],
+                "instances": [
+                    {"id": f"k{j}", "template": "Mid",
+                     "bindings": {"p": "p"}}
+                    for j in range(3)
+                ],
+                "top": "r",
+            },
+        },
+        "root": {"template": "Root", "bindings": {"p": "e1"}},
+    }
+    r = post(payload)
+    assert r.status_code == 422
+    assert "64" in r.json()["detail"]
+
+
+def test_dense_boundary_65_rejected_64_ok():
+    """稠密边界：1 个自身门 + n 个 8 门叶子，n=7 得 57、n=8 得 65。
+
+    另构造跨两层恰好 64 门的结构，确认恰好在边界上仍可展开。
+    """
+    def build(n_kids):
+        return {
+            "events": [{"id": "e1", "p": "1/2"}],
+            "templates": {
+                "Leaf": {
+                    "params": ["p"],
+                    "gates": [
+                        {"id": f"g{j}", "op": "NOT", "inputs": ["p"]}
+                        for j in range(8)
+                    ],
+                    "instances": [],
+                    "top": "g7",
+                },
+                "Box": {
+                    "params": ["p"],
+                    "gates": [{"id": "h", "op": "NOT", "inputs": ["p"]}],
+                    "instances": [
+                        {"id": f"k{j}", "template": "Leaf",
+                         "bindings": {"p": "p"}}
+                        for j in range(n_kids)
+                    ],
+                    "top": "h",
+                },
+            },
+            "root": {"template": "Box", "bindings": {"p": "e1"}},
+        }
+
+    # 1 + 8*8 = 65 > 64：超限拒绝
+    r_over = post(build(8))
+    assert r_over.status_code == 422
+    assert "64" in r_over.json()["detail"]
+
+    # 1 + 7*8 = 57 <= 64：正常展开
+    r_under = post(build(7))
+    assert r_under.status_code == 200, r_under.text
+    assert len(r_under.json()["gates"]) == 57
+
+    # 跨两层恰好 64：
+    # Mid  = 7 自身门 + 1 个 LeafA(8) + 1 个 LeafB(8) = 23；
+    # Root = 2 自身门 + 3 个 Mid(23*3=69) 不对，取 2 个 Mid + 补门：
+    # Root = 18 自身门 + 2 个 Mid(46) = 64。
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": {
+            "LeafA": {
+                "params": ["p"],
+                "gates": [
+                    {"id": f"a{j}", "op": "NOT", "inputs": ["p"]}
+                    for j in range(8)
+                ],
+                "instances": [],
+                "top": "a7",
+            },
+            "LeafB": {
+                "params": ["p"],
+                "gates": [
+                    {"id": f"b{j}", "op": "NOT", "inputs": ["p"]}
+                    for j in range(8)
+                ],
+                "instances": [],
+                "top": "b7",
+            },
+            "Mid": {
+                "params": ["p"],
+                "gates": [
+                    {"id": f"m{j}", "op": "NOT", "inputs": ["p"]}
+                    for j in range(7)
+                ],
+                "instances": [
+                    {"id": "x", "template": "LeafA",
+                     "bindings": {"p": "p"}},
+                    {"id": "y", "template": "LeafB",
+                     "bindings": {"p": "p"}},
+                ],
+                "top": "m0",
+            },
+            "Root": {
+                "params": ["p"],
+                "gates": [
+                    {"id": f"r{j}", "op": "NOT", "inputs": ["p"]}
+                    for j in range(18)
+                ],
+                "instances": [
+                    {"id": "u", "template": "Mid",
+                     "bindings": {"p": "p"}},
+                    {"id": "v", "template": "Mid",
+                     "bindings": {"p": "p"}},
+                ],
+                "top": "r0",
+            },
+        },
+        "root": {"template": "Root", "bindings": {"p": "e1"}},
+    }
+    # 18 + 2*(7 + 8 + 8) = 18 + 46 = 64
+    r_exact = post(payload)
+    assert r_exact.status_code == 200, r_exact.text
+    assert len(r_exact.json()["gates"]) == 64
+
+
+def test_unreachable_huge_template_ignored_by_limit_but_still_validated():
+    """根未触达的模板不参与门数统计，但其静态错误仍被校验。"""
+    base_templates = {
+        "Main": {
+            "params": ["p"],
+            "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+            "instances": [],
+            "top": "g",
+        },
+        # 未被 root 触达：即使该模板被实例化会发射远超 64 个门，
+        # 也不影响根实例的门数判定。
+        "Huge": {
+            "params": ["p"],
+            "gates": [
+                {"id": f"g{j}", "op": "NOT", "inputs": ["p"]}
+                for j in range(8)
+            ],
+            "instances": [
+                {"id": f"c{j}", "template": "HugeLeaf",
+                 "bindings": {"p": "p"}}
+                for j in range(8)
+            ],
+            "top": "g0",
+        },
+        "HugeLeaf": {
+            "params": ["p"],
+            "gates": [
+                {"id": f"h{j}", "op": "NOT", "inputs": ["p"]}
+                for j in range(8)
+            ],
+            "instances": [],
+            "top": "h7",
+        },
+    }
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": base_templates,
+        "root": {"template": "Main", "bindings": {"p": "e1"}},
+    }
+    r = post(payload)
+    assert r.status_code == 200, r.text
+    assert len(r.json()["gates"]) == 1
+
+    # 未触达模板自身有静态错误时仍须拒绝（沿用全模板校验）
+    bad = {
+        "Main": {
+            "params": ["p"],
+            "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+            "instances": [],
+            "top": "g",
+        },
+        "Bad": {
+            "params": ["p"],
+            "gates": [{"id": "g", "op": "NOT",
+                       "inputs": ["p", "p"]}],  # NOT 元数错误
+            "instances": [],
+            "top": "g",
+        },
+    }
+    r2 = post({
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": bad,
+        "root": {"template": "Main", "bindings": {"p": "e1"}},
+    })
+    assert r2.status_code == 422 and "NOT" in r2.json()["detail"]
 
 
 def test_expanded_gate_id_clashes_with_event():
