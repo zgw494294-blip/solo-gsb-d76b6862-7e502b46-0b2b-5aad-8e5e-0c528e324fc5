@@ -825,9 +825,121 @@ curl -s -X POST http://localhost:8000/v1/expand-model \
   完整实例链：`root/实例1/实例2/门名`；被调模板未使用的参数与未被 `top` 引用的门均允许存在。
 - **模板间不允许递归**（直接自递归或多模板相互递归，即使未被 `root` 触达）；模板**内部**
   的门引用关系也不允许成环。
-- **展开后的门总数超过 64**（与 `/v1/analyze` 的门数上限一致）时返回 422。
+- **展开后的门总数超过 64**（与 `/v1/analyze` 的门数上限一致）时返回 422。判限在实例展开
+  之前完成：先在**模板调用图**（最多 8 个模板顶点）上按「模板自身门数 + 各子实例展开门数
+  之和」做记忆化限幅计数，只统计 `root` 实际触达的模板、不遍历完整实例树——即使结构合法、
+  无递归的 8 层模板每层含 8 个子实例（实例总数约 240 万、每模板只有 1 个门），也会立即
+  返回 422 而不会产生超限延迟。门总数**恰好 64 时仍可正常展开**。
+- 门数限幅只针对 `root` 的展开结果：`root` 未引用的模板即使单独展开会超 64 也不影响本次
+  请求，但其命名、绑定、引用、门环、递归等**原有静态校验仍对全部模板逐一执行**。
 - 除上述模板规则外，事件与门的其余校验（概率、ASCII id、门元数、引用、环等）沿用
   `/v1/analyze`；展开后的门路径若与事件 id 冲突同样返回 422。
+
+### 密集嵌套超限示例（立即 422，不遍历实例树）
+
+每层模板 `L{i}` 各只有 1 个门，却含 8 个 `L{i-1}` 子实例。8 层时展开门数为
+`1 + 8 + 8² + … + 8⁷ = 2 396 745`，远超 64：
+
+```bash
+curl -X POST http://localhost:8000/v1/expand-model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [{"id": "e1", "p": "1/2"}],
+    "templates": {
+      "L0": {
+        "params": ["p"],
+        "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+        "instances": [],
+        "top": "g"
+      },
+      "L1": {
+        "params": ["p"],
+        "gates": [{"id": "g", "op": "OR", "inputs": ["p", "c0"]}],
+        "instances": [
+          {"id": "c0", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c1", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c2", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c3", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c4", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c5", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c6", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c7", "template": "L0", "bindings": {"p": "p"}}
+        ],
+        "top": "g"
+      }
+    },
+    "root": {"template": "L1", "bindings": {"p": "e1"}}
+  }'
+```
+
+上例 2 层时为 `1 + 8 = 9` 门，可以正常展开；把同样结构加到 8 层（`root` 用 `L7`）后，
+服务在模板调用图上限幅计数判超，**不遍历约 240 万个实例**即返回：
+
+```json
+{ "detail": "根实例（模板 'L7'）展开后的门总数超过 64 个上限：已在模板调用图上按“模板自身门数 + 各子实例展开门数之和”限幅计数判超（未遍历完整实例树）；请减少嵌套层数或每层的子实例数，展开后门总数不超过 64 时才可展开" }
+```
+
+### 边界输入：恰好 64 门仍可展开
+
+门总数等于上限时不触发 422。下例 `L0` 有 1 个门，`L1` 自身 1 门加 7 个 `L0` 子实例共
+8 门，`L2` 自身 8 门加 7 个 `L1` 子实例共 `8 + 7×8 = 64` 门：
+
+```bash
+curl -X POST http://localhost:8000/v1/expand-model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [{"id": "e1", "p": "1/2"}],
+    "templates": {
+      "L0": {
+        "params": ["p"],
+        "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+        "instances": [],
+        "top": "g"
+      },
+      "L1": {
+        "params": ["p"],
+        "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+        "instances": [
+          {"id": "c0", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c1", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c2", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c3", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c4", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c5", "template": "L0", "bindings": {"p": "p"}},
+          {"id": "c6", "template": "L0", "bindings": {"p": "p"}}
+        ],
+        "top": "g"
+      },
+      "L2": {
+        "params": ["p"],
+        "gates": [
+          {"id": "g0", "op": "NOT", "inputs": ["p"]},
+          {"id": "g1", "op": "NOT", "inputs": ["p"]},
+          {"id": "g2", "op": "NOT", "inputs": ["p"]},
+          {"id": "g3", "op": "NOT", "inputs": ["p"]},
+          {"id": "g4", "op": "NOT", "inputs": ["p"]},
+          {"id": "g5", "op": "NOT", "inputs": ["p"]},
+          {"id": "g6", "op": "NOT", "inputs": ["p"]},
+          {"id": "g7", "op": "NOT", "inputs": ["p"]}
+        ],
+        "instances": [
+          {"id": "d0", "template": "L1", "bindings": {"p": "p"}},
+          {"id": "d1", "template": "L1", "bindings": {"p": "p"}},
+          {"id": "d2", "template": "L1", "bindings": {"p": "p"}},
+          {"id": "d3", "template": "L1", "bindings": {"p": "p"}},
+          {"id": "d4", "template": "L1", "bindings": {"p": "p"}},
+          {"id": "d5", "template": "L1", "bindings": {"p": "p"}},
+          {"id": "d6", "template": "L1", "bindings": {"p": "p"}}
+        ],
+        "top": "g7"
+      }
+    },
+    "root": {"template": "L2", "bindings": {"p": "e1"}}
+  }'
+```
+
+响应为 `200`，`gates` 恰好含 64 个门（`root/g0`…`root/g7` 与 7 组 `root/d*/…` 路径）；
+把 `L2` 自身改为 9 个门（总数 65）则返回上面的 422。
 
 绑定缺项的响应示例（`Voter` 需要 `a`、`b` 两个参数，只绑定了一个）：
 
@@ -933,7 +1045,8 @@ curl -s -X POST http://localhost:8000/v1/expand-model \
   重名（含跨种类重名）、门元数非法、root 或子实例调用未定义模板、`bindings` 缺项或
   绑定了不属于被调模板的参数、root 参数绑定到未知事件、子实例参数绑定到非父参数、
   门输入或 `top` 引用未知本地节点、模板内门成环、模板间递归（含未被 root 触达的模板）、
-  或展开后门总数超过 **64**；
+  或根实例展开后门总数超过 **64**（展开前先在模板调用图上记忆化限幅计数，不为判限遍历
+  完整实例树；恰好 64 门仍可展开）；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
   （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next`、
   `/v1/likely-cause`、`/v1/failure-count`、`/v1/first-failure-time` 与

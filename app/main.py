@@ -112,8 +112,9 @@ POST /v1/expand-model
         id），子实例输出解析为子实例的展开 top；共用事件保留原 id。
         返回原 events 与展开后的 gates、top，可直接提交给 /v1/analyze。
   模板定义错误（名称非法、参数/门/实例重名、门元数、绑定缺项/多余、
-  未知引用、门环、调用未知模板、模板递归、展开后门超过 64 个）均返回
-  422 并说明原因；事件与门的校验沿用 /v1/analyze 的规则。
+  未知引用、门环、调用未知模板、模板递归、根实例展开门数在模板调用
+  图上限幅计数即超过 64 个）均返回 422 并说明原因；全部模板（含根
+  实例未引用者）都完成静态校验；事件与门的校验沿用 /v1/analyze 规则。
 
 所有错误输入（未知引用、跨版引用、环、非法概率、节点超限等）统一返回 422。
 """
@@ -1483,7 +1484,38 @@ def expand_model_logic(payload: ExpandModelRequest) -> ExpandModelResponse:
     for name in sorted(templates):
         dfs_template(name)
 
-    # ---- 递归展开 ----
+    # ---- 根实例展开门数：先在模板调用图上记忆化限幅计数 ----
+    # 调用图已确认为 DAG（顶点至多 8 个）。N(T) = T 单次实例化产生的
+    # 门数 = T 自身门数 + Σ_子实例 N(被调模板)（每个子实例各加一次，
+    # N 本身只按模板记忆化计算一次）。计数只与至多 8 个模板有关，与
+    # 实例树规模无关——8 层、每层 8 个子实例时实例约 240 万个，逐实例
+    # 遍历会造成超限延迟。数值在 MAX_EXPANDED_GATES+1 处饱和，超限
+    # 立即 422。未超限时计数为精确值，且每个模板至少 1 个门，故实例
+    # 总数 ≤ 门总数 ≤ 64，随后的 top 解析与门发射只遍历一棵很小的实例树。
+    expanded_gate_counts: Dict[str, int] = {}
+
+    def count_expanded_gates(name: str) -> int:
+        if name in expanded_gate_counts:
+            return expanded_gate_counts[name]
+        total = len(templates[name].gates)
+        for inst in templates[name].instances:
+            total += count_expanded_gates(inst.template)
+            if total > MAX_EXPANDED_GATES:
+                total = MAX_EXPANDED_GATES + 1
+                break
+        expanded_gate_counts[name] = total
+        return total
+
+    if count_expanded_gates(root.template) > MAX_EXPANDED_GATES:
+        raise ValueError(
+            f"根实例（模板 {root.template!r}）展开后的门总数超过 "
+            f"{MAX_EXPANDED_GATES} 个上限：已在模板调用图上按"
+            "“模板自身门数 + 各子实例展开门数之和”限幅计数判超"
+            "（未遍历完整实例树）；请减少嵌套层数或每层的子实例数，"
+            f"展开后门总数不超过 {MAX_EXPANDED_GATES} 时才可展开"
+        )
+
+    # ---- 递归展开（进入此处时实例总数 ≤ 64，遍历规模有界）----
     # path 为实例 id 路径（root 层为 ["root"]）；param_map 把本模板参数
     # 解析为父域引用（root 层即事件 id）。子实例的展开 top 只依赖其子树，
     # 故先用一个纯解析趟递归求出各实例的 top 引用，再按“本模板门在前、

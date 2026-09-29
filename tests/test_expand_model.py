@@ -5,6 +5,7 @@
 
 import itertools
 import random
+import time
 from fractions import Fraction
 
 from fastapi.testclient import TestClient
@@ -954,6 +955,199 @@ def test_expansion_exactly_64_gates_ok():
     r = post(payload)
     assert r.status_code == 200, r.text
     assert len(r.json()["gates"]) == 64
+
+
+def _wide_dense_templates(levels, branching):
+    """levels 层、每层 branching 个子实例的稠密模板调用树（每个模板仅
+    1 个门）：门数 = 1 + b + b² + … + b^(levels-1)，结构合法且无递归。"""
+    templates = {}
+    for i in range(levels):
+        name = f"L{i}"
+        if i == 0:
+            tpl_def = {
+                "params": ["p"],
+                "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+                "instances": [],
+                "top": "g",
+            }
+        else:
+            child_ids = [f"c{j}" for j in range(branching)]
+            tpl_def = {
+                "params": ["p"],
+                # 仅引用第一个子实例；其余子实例未被门引用但仍随实例树
+                # 展开（同“未使用门也发射”的既有语义），故计入门数。
+                "gates": [{"id": "g", "op": "OR",
+                           "inputs": ["p", child_ids[0]]}],
+                "instances": [
+                    {"id": cid, "template": f"L{i-1}",
+                     "bindings": {"p": "p"}}
+                    for cid in child_ids
+                ],
+                "top": "g",
+            }
+        templates[name] = tpl_def
+    return templates
+
+
+def test_dense_expansion_over_64_rejected_without_traversal():
+    """8 层 × 每层 8 个子实例、每模板仅 1 门：门数 = (8^8-1)/7 ≈ 240 万。
+
+    结构合法、无递归，必须在模板调用图上限幅计数后立即 422，不得为判限
+    遍历约 240 万个实例（旧实现会先全树反复解析子实例 top，造成超限延迟）。
+    """
+    templates = _wide_dense_templates(levels=8, branching=8)
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": templates,
+        "root": {"template": "L7", "bindings": {"p": "e1"}},
+    }
+    start = time.perf_counter()
+    r = post(payload)
+    elapsed = time.perf_counter() - start
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "64" in detail and "展开" in detail
+    # 限幅计数只涉及 8 个模板：即使宽松计时也必须远快于逐实例遍历
+    assert elapsed < 2.0, f"判限耗时 {elapsed:.3f}s，疑似遍历了完整实例树"
+
+
+def test_dense_expansion_exactly_64_ok():
+    """稠密（宽）树的 64 门边界：L0 1 门；L1 自身 1 门 + 7 个 L0 = 8 门；
+    L2 自身 8 门 + 7 个 L1 = 8 + 7*8 = 64，恰好 64 门仍可展开。"""
+    templates = {
+        "L0": {
+            "params": ["p"],
+            "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+            "instances": [],
+            "top": "g",
+        },
+        "L1": {
+            "params": ["p"],
+            "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+            "instances": [
+                {"id": f"c{j}", "template": "L0",
+                 "bindings": {"p": "p"}}
+                for j in range(7)
+            ],
+            "top": "g",
+        },
+        "L2": {
+            "params": ["p"],
+            "gates": [
+                {"id": f"g{k}", "op": "NOT", "inputs": ["p"]}
+                for k in range(8)
+            ],
+            "instances": [
+                {"id": f"d{j}", "template": "L1",
+                 "bindings": {"p": "p"}}
+                for j in range(7)
+            ],
+            "top": "g7",
+        },
+    }
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": templates,
+        "root": {"template": "L2", "bindings": {"p": "e1"}},
+    }
+    r = post(payload)
+    assert r.status_code == 200, r.text
+    assert len(r.json()["gates"]) == 64
+
+
+def test_dense_expansion_65_gates_rejected():
+    """上一例把 L2 自身加到 9 门：9 + 7*8 = 65，稠密树超限立即 422。"""
+    templates = {
+        "L0": {
+            "params": ["p"],
+            "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+            "instances": [],
+            "top": "g",
+        },
+        "L1": {
+            "params": ["p"],
+            "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+            "instances": [
+                {"id": f"c{j}", "template": "L0",
+                 "bindings": {"p": "p"}}
+                for j in range(7)
+            ],
+            "top": "g",
+        },
+        "L2": {
+            "params": ["p"],
+            "gates": [
+                {"id": f"g{k}", "op": "NOT", "inputs": ["p"]}
+                for k in range(9)
+            ],
+            "instances": [
+                {"id": f"d{j}", "template": "L1",
+                 "bindings": {"p": "p"}}
+                for j in range(7)
+            ],
+            "top": "g8",
+        },
+    }
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": templates,
+        "root": {"template": "L2", "bindings": {"p": "e1"}},
+    }
+    start = time.perf_counter()
+    r = post(payload)
+    elapsed = time.perf_counter() - start
+    assert r.status_code == 422 and "64" in r.json()["detail"]
+    assert elapsed < 2.0
+
+
+def test_overlimit_in_unreachable_template_kept_but_not_counted():
+    """门数限幅只统计 root 实际展开的实例树：root 未引用的模板即便单独
+    展开会超 64（稠密 7 层 × 8 子实例 ≈ 30 万门），也不影响 root 的展开
+    结果；但该模板的原有静态校验（命名、绑定、引用、环、递归等）仍全部完成。"""
+    dense = _wide_dense_templates(levels=7, branching=8)
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": {
+            "Main": {
+                "params": ["p"],
+                "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+                "instances": [],
+                "top": "g",
+            },
+            **dense,
+        },
+        "root": {"template": "Main", "bindings": {"p": "e1"}},
+    }
+    start = time.perf_counter()
+    r = post(payload)
+    elapsed = time.perf_counter() - start
+    assert r.status_code == 200, r.text
+    assert len(r.json()["gates"]) == 1
+    assert elapsed < 2.0
+
+
+def test_unreachable_template_still_fully_validated():
+    """root 未引用的模板出现静态错误（top 引用未知节点）仍返回 422。"""
+    payload = {
+        "events": [{"id": "e1", "p": "1/2"}],
+        "templates": {
+            "Main": {
+                "params": ["p"],
+                "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+                "instances": [],
+                "top": "g",
+            },
+            "Orphan": {
+                "params": ["p"],
+                "gates": [{"id": "g", "op": "NOT", "inputs": ["p"]}],
+                "instances": [],
+                "top": "nope",
+            },
+        },
+        "root": {"template": "Main", "bindings": {"p": "e1"}},
+    }
+    r = post(payload)
+    assert r.status_code == 422 and "未知" in r.json()["detail"]
 
 
 def test_expanded_gate_id_clashes_with_event():
